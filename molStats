@@ -1,0 +1,581 @@
+#!/usr/bin/perl
+#################################################
+# PROGRAM: molStats
+# PURPOSE: This program compares initial to final molecules after a LAMMPS
+#       condensation.
+# UPDATED: Mar. 25, 2013
+# USAGE:
+#################################################
+
+#################################################
+# USE MODULES
+#################################################
+use strict;
+use warnings;
+use diagnostics;
+use Getopt::Long;
+
+#################################################
+# DECLARE GLOBAL VARIABLES
+#################################################
+
+# Command line information
+my $help;
+
+my $dumpFileName;
+my $dataFileName;
+
+my $frame;
+my $timestep;
+
+my $aBxCHy;
+
+# Main header information
+my $title;
+my $date = `date`;
+chomp($date);
+
+# Processing
+my @values;
+
+my @timesteps;
+my $totFrames = 0;
+
+# Data file
+my $atomID;
+my @moleculeID; #Index = atomID; value = molecule number
+my @molecules; #Index = molecule number; value = array of atoms in molecule
+
+my $totAtoms = 0;
+my $totMolsBeg = 0;
+
+# Dump file
+my $dumpBondID;
+my @dumpBonds;
+
+my @endMoleculeID; #Index = atomID; value = molecule number
+my %endMoleculeIDSeen; #Index = atomID; value = molecule number
+my @endMolecules; #Index = molecule number; value = array of initial
+                  #molecules that have combined to make this molecule
+
+my $totDumpBonds = 0;
+my $totMolsEnd = 0;
+
+#################################################
+# **********************************************
+#################################################
+# **********************************************
+#
+# THE MAIN PART OF THE PROGRAM
+#
+# **********************************************
+#################################################
+# **********************************************
+#################################################
+
+#################################################
+# READ COMMAND LINE
+#################################################
+
+# Read command line arguments and check if help has been requested
+GetOptions ('h|help' => \$help, 'dum|dump:s' => \$dumpFileName,
+    'dat|data:s' => \$dataFileName, 'f|frame:s' => \$frame,
+    't|timestep:s' => \$timestep);
+
+# Print help information if requested
+if ($help) { &printHelp; }
+
+#################################################
+# READ DATA FILE
+#################################################
+
+# Open input file for reading
+if (! open DATAFILE, '<', $dataFileName) {
+    die "Unable to open the data file\n";
+}
+
+# Read the title
+chomp($title = <DATAFILE>);
+if ($title eq "") {
+    $title = "title";
+}
+
+# Move to the Atoms section
+while (my $line = <DATAFILE>) {
+    if ($line =~ /\AAtoms\Z/i) {
+        last;
+    }
+}
+
+<DATAFILE>; #Throw away next line (which is blank)
+
+#Read the Atoms section
+while (my $line = <DATAFILE>) {
+    if ($line =~ /\A(?:\s+)?\Z/) { last; }
+    chomp($line);
+
+    @values = split(/\s+/, $line);
+
+    $totAtoms = $values[0];
+
+    $moleculeID[$totAtoms] = $values[1];
+    push(@{$molecules[$values[1]]}, $totAtoms);
+
+    if ($values[1] > $totMolsBeg) {
+        $totMolsBeg = $values[1];
+    }
+}
+
+#################################################
+# READ DUMP FILE
+#################################################
+
+# Open dump file for reading
+if (! open DUMPFILE, '<', $dumpFileName) {
+    die "Cannot open dump file for reading\n";
+}
+
+# Read the timesteps and put them in @timesteps indexed by frame number
+my $sawTimestep = 0;
+while (my $line = <DUMPFILE>) {
+    if ($line =~ /TIMESTEP/) {
+        $totFrames++;
+        $sawTimestep = 1;
+    } elsif ($sawTimestep == 1) { #The timestep number is on the next line
+        chomp($line);
+        $timesteps[$totFrames] = $line;
+        $sawTimestep = 0;
+    }
+}
+
+# Check the requested timestep or frame number and put either in terms of
+# both the timestep and frame number (i.e. set both $fram and $timestep to
+# the correct values
+if ($frame) {
+    if (($frame > $totFrames) || ($frame < 0 - $totFrames)) {
+        print "Frame $frame out of range.\n";
+        die "ABORTING.\n";
+    }
+
+    #If a negative frame number is given
+    if ($frame =~ /\A-/) {
+        $frame = $totFrames + ($frame + 1);
+        $timestep = $timesteps[$frame];
+    } else {
+        $timestep = $timesteps[$frame];
+    }
+} elsif ($timestep) {
+    my $found = 0;
+    foreach my $step (1..$totFrames) {
+        if ($timesteps[$step] == $timestep) {
+            $found = 1;
+        }
+    }
+    if (!$found) {
+        print "Timestep $timestep not found.\n";
+        die "ABORTING.\n";
+    }
+} else {
+    print "Must specify either a timestep or a frame number to read the " .
+          "dumpfile.\n";
+    die "ABORTING.\n";
+}
+
+# Go back to the beginning of the dump file
+seek(DUMPFILE,0,0);
+
+# Move to the desired timestep or frame
+while (my $line = <DUMPFILE>) {
+    if ($line =~ /\A$timestep\Z/) { last; }
+}
+
+# Move to the bonds section of that timestep or frame
+while (my $line = <DUMPFILE>) {
+    if ($line =~ /\AITEM: ENTRIES/) { last; }
+}
+
+# Read to the end of the timestep / frame
+while (my $line = <DUMPFILE>) {
+    if ($line =~ /TIMESTEP/) { last; } #End loop at end of frame
+    chomp($line);
+
+    @values = split(/\s+/, $line);
+
+    $totDumpBonds++;
+
+    $dumpBonds[$totDumpBonds] = [$values[2], $values[3]];
+}
+
+#################################################
+# BUILD THE LIST OF NEW MOLECULES
+#################################################
+
+# This section uses the information from the bonds section to determine
+# which atoms are in which molecules and uses that to write the molecules
+# information for the atoms.
+
+# In the array called @endMoleculeID, each index corresponds to an
+# atomID (index 0 isn't used). Each value is the new molecule number of the
+# atom referenced by the index.
+#     The list of bonds is read through by bondID and both atoms are placed
+# in a molecule named after the smaller atomID of the two atoms. For example,
+# if atoms 3 and 12 were in the current bond being read, the value of the
+# array @endMoleculeID at both indices 3 and 12 (the atoms) would be set to 3
+# (the ending molecule).
+#     As the bonds are read, some atoms will have a molecule already listed
+# in @endMoleculeID at their corresponding index from a previous bond. In this
+# case, the subroutine &findTheIndex is called to find the indices (atoms)
+# of all the instances of this molecule. This will return a list of all the
+# atoms (index = atomID) currently in this molecule. The two atoms in the
+# bond being considered are added to this list and the smallest atomID in
+# the list is determined. This smallest atomID becomes the new name (i.e.
+# number; "molecule name" = "molecule number") of the molecule containing
+# all these atoms. The values (molecule names) at the indices in @endMoleculeID
+# corresponding to each of these atoms is then rewritten with the new
+# molecule name. After looping over all the bonds, each value of @endMoleculeID
+# will hold the molecule number for the molecule containing the atom
+# referenced by its index.
+#     After that, you have a bunch of molecules named things like "3", "57",
+# etc. when there maybe isn't a molecule "2" or "14", so to make things a
+# little nicer-looking, we go back and rename all the molecules again with
+# contiguous numbers starting with "1". This just involves a loop over all
+# the values of @endMoleculeID with a variable $totMolsEnd counting up each
+# time a new value (molecule name) is found along with a hash to keep track
+# of old molecule names and corresponding new molecule names (see below).
+
+foreach my $bondID (1..$totDumpBonds) {
+    #Declare some variables
+    my $loAtom;
+    my $hiAtom;
+    my $oldMolecule;
+    my $oldMolecule1;
+    my $oldMolecule2;
+    my $newMolecule;
+    my @atomsToChange;
+
+    #Find which atomID is smaller (we'll use this for the name of the
+    #molecule containing both atoms)
+    if ($dumpBonds[$bondID][0] < $dumpBonds[$bondID][1]) {
+        $loAtom = $dumpBonds[$bondID][0];
+        $hiAtom = $dumpBonds[$bondID][1];
+    } else {
+        $loAtom = $dumpBonds[$bondID][1];
+        $hiAtom = $dumpBonds[$bondID][0];
+    }
+
+    if (!$endMoleculeID[$loAtom]) {
+
+        if (!$endMoleculeID[$hiAtom]) {
+            #If there's no molecule listed for either atom in the bond
+            #being considered, name the molecule containing them with the
+            #number of the lower of the two atomIDs
+            $endMoleculeID[$loAtom] = $loAtom;
+            $endMoleculeID[$hiAtom] = $loAtom;
+
+        } elsif ($endMoleculeID[$hiAtom]) {
+            #If there's no molecule listed for the atom with the lower
+            #atomID but there IS a molecule listed for the atom with the
+            #higher atomID: name that listed molecule $oldMolecule
+            $oldMolecule = $endMoleculeID[$hiAtom];
+
+            #The new molecule name will be the lower of that old name and
+            #the lower atomID of the current two atoms (effectively the
+            #lowest atomID of all the atoms in the molecule)
+
+            #The subroutine &minValue is used to find the minimum value of
+            #an array (in this case, the array in question contains only
+            #the old molecule name and the current low atomID)
+            $newMolecule = &minValue($loAtom, $oldMolecule);
+
+            #The subroutine &findTheIndex is used to find all the atoms
+            #(index = atomID) in @endMoleculeID that belong to molecules named
+            #after $oldMolecule or either of the two new atoms. All these
+            #atoms (including the two new ones) are put in an array called
+            #@atomsToChange
+            @atomsToChange = ($loAtom, $hiAtom);
+            push(@atomsToChange, &findTheIndex($loAtom, @endMoleculeID));
+            push(@atomsToChange, &findTheIndex($hiAtom, @endMoleculeID));
+            push(@atomsToChange, &findTheIndex($oldMolecule, @endMoleculeID));
+            #Remove any duplicate atoms from @atomsToChange
+            @atomsToChange = &removeDuplicates(@atomsToChange);
+
+            #For each atom in @atomsToChange, change the molecule name at
+            #the corresponding index in @endMoleculeID to the new molecule name
+            foreach my $atom (@atomsToChange) {
+                $endMoleculeID[$atom] = $newMolecule;
+            }
+        }
+
+    } elsif ($endMoleculeID[$loAtom]) {
+        if (!$endMoleculeID[$hiAtom]) {
+            #If there's no molecule listed for the atom with the higher
+            #atomID but there IS a molecule listed for the atom with the
+            #lower atomID: name that listed molecule $oldMolecule
+            $oldMolecule = $endMoleculeID[$loAtom];
+
+            #The new molecule name will be the lower of that old name and
+            #the lower atomID of the current two atoms (effectively the
+            #lowest atomID of all the atoms in the molecule)
+
+            #The subroutine &minValue is used to find the minimum value of
+            #an array (in this case, the array in question contains only
+            #the old molecule name and the current low atomID)
+            $newMolecule = &minValue($loAtom, $oldMolecule);
+
+            #The subroutine &findTheIndex is used to find all the atoms
+            #(index = atomID) in @endMoleculeID that belong to molecules named
+            #after $oldMolecule or either of the two new atoms. All these
+            #atoms (including the two new ones) are put in an array called
+            #@atomsToChange
+            @atomsToChange = ($loAtom, $hiAtom);
+            push(@atomsToChange, &findTheIndex($loAtom, @endMoleculeID));
+            push(@atomsToChange, &findTheIndex($hiAtom, @endMoleculeID));
+            push(@atomsToChange, &findTheIndex($oldMolecule, @endMoleculeID));
+            #Remove any duplicate atoms from @atomsToChange
+            @atomsToChange = &removeDuplicates(@atomsToChange);
+
+            #For each atom in @atomsToChange, change the molecule name at
+            #the corresponding index in @endMoleculeID to the new molecule name
+            foreach my $index (@atomsToChange) {
+                $endMoleculeID[$index] = $newMolecule;
+            }
+
+        } elsif ($endMoleculeID[$hiAtom]) {
+            #If there are molecules listed for BOTH the atom with the
+            #higher atomID AND the atom with the lower atomID: name those
+            #listed atoms $oldMolecule1 and $oldMolecule2
+            $oldMolecule1 = $endMoleculeID[$loAtom];
+            $oldMolecule2 = $endMoleculeID[$hiAtom];
+
+            #The new molecule name will be the lowest of the two old names
+            #and the lower atomID of the current two atoms (effectively the
+            #lowest atomID of all the atoms in the molecule)
+
+            #The subroutine &minValue is used to find the minimum value of
+            #an array (in this case, the array in question contains both of
+            #the old molecule names and the current low atomID)
+            $newMolecule = &minValue($loAtom, $oldMolecule1, $oldMolecule2);
+
+            #The subroutine &findTheIndex is used to find all the atoms
+            #(index = atomID) in @endMoleculeID that belong to molecules named
+            #after $oldMolecule1, $oldMolecule2, or either of the two new
+            #atoms. All these atoms (including the two new ones) are put in
+            #an array called @atomsToChange
+            @atomsToChange = ($loAtom, $hiAtom);
+            push(@atomsToChange, &findTheIndex($loAtom, @endMoleculeID));
+            push(@atomsToChange, &findTheIndex($hiAtom, @endMoleculeID));
+            push(@atomsToChange, &findTheIndex($oldMolecule1, @endMoleculeID));
+            push(@atomsToChange, &findTheIndex($oldMolecule2, @endMoleculeID));
+            #Remove any duplicate atoms from @atomsToChange
+            @atomsToChange = &removeDuplicates(@atomsToChange);
+
+            #For each atom in @atomsToChange, change the molecule name at
+            #the corresponding index in @endMoleculeID to the new molecule name
+            foreach my $atom (@atomsToChange) {
+                $endMoleculeID[$atom] = $newMolecule;
+            }
+        }
+
+    }
+
+}
+
+# Label any atoms that haven't been added to a molecule (i.e. atoms that
+# aren't bonded to anything) as being in molecule number "0".
+foreach my $atom (1..$totAtoms) {
+    if (!$endMoleculeID[$atom]) {
+        $endMoleculeID[$atom] = 0;
+    }
+}
+
+# Rename the molecules with contiguous numbers starting with "1"
+
+# As the atoms in @endMoleculeID are looped over, $totMolsEnd counts up
+# whenever a molecule name is "seen" for the first time. When this happens,
+# a new key with the name of that molecule is created in the hash
+# %endMoleculeIDSeen which corresponds to a value holding the current
+# $totMolsEnd. The molecule for that atom is then renamed with the value
+# of $totMolsEnd.
+#     If the molecule name being considered has already been seen (i.e.
+# there exists a key with its name in %endMoleculeIDSeen), $totMolsEnd is not
+# increased and the molecule for the current atom is renamed with the
+# value corresponding to the hash key that shares a name with the current
+# molecule. (That is, the molecule can't be renamed to the current value of
+# $totMolsEnd--it has to be renamed to what $totMolsEnd was when the
+# first atom in the current molecule was considered--a value which is stored
+# in %endMoleculeIDSeen.
+foreach my $atom (1..$totAtoms) {
+    if ($endMoleculeID[$atom]) {
+        #Skip the atoms that don't belong to a molecule (molecule "0")
+        if ($endMoleculeIDSeen{$endMoleculeID[$atom]}) {
+            #If the old molecule name has already been seen, look in
+            #%endMoleculeIDSeen for the new molecule name
+            $endMoleculeID[$atom] = $endMoleculeIDSeen{$endMoleculeID[$atom]};
+        } else {
+            #If the old molecule has not been seen yet, icrease $totMolecules
+            #and name the new molecule the value of $totMolecules. Also, create
+            #a key with the old molecule name in %endMoleculeIDSeen holding this
+            #value of $totMolecules.
+            $totMolsEnd++;
+            $endMoleculeIDSeen{$endMoleculeID[$atom]} = $totMolsEnd;
+            $endMoleculeID[$atom] = $totMolsEnd;
+        }
+    }
+}
+
+# Fill the @endMolecules array. Indices correspond to ending molecule IDs,
+# values are arrays of the starting molecule IDs of molecules that have
+# joined to form the ending molecule referenced by the index.
+foreach my $atom (1..$totAtoms) {
+    my $oldMol = $moleculeID[$atom];
+    my $newMol = $endMoleculeID[$atom];
+    push(@{$endMolecules[$newMol]}, $oldMol);
+}
+# Remove duplicates
+foreach my $newMol (1..$totMolsEnd) {
+    @{$endMolecules[$newMol]} = &removeDuplicates(@{$endMolecules[$newMol]});
+}
+
+#################################################
+# PRINT A HEADER
+#################################################
+
+print "#################################################\n";
+print "# molStats ######################################\n";
+print "#################################################\n#\n";
+
+print "# For the case of: $title\n";
+print "# Timestep: $timestep\n";
+print "# Date: $date\n#\n";
+
+print "# Total beginning molecules: $totMolsBeg\n";
+print "# Total ending molecules: $totMolsEnd\n#\n";
+
+print "#################################################\n\n";
+
+#################################################
+# WRITE THE LIST ATOMS BY MOLECULE
+#################################################
+
+print "#################################################\n";
+print "# ENDING MOLECULES BY BEGINNING MOLECULES #######\n";
+print "#################################################\n#\n";
+print "# END_MOLECULE: BEG_MOLECULE\n";
+
+foreach my $mol (1..$totMolsEnd) {
+    print "#\n# Molecule $mol:\n";
+    my $numPrinted = 0;
+    foreach my $atom (@{$endMolecules[$mol]}) {
+        $numPrinted++;
+        if ($numPrinted == 1) {
+            print "# $atom";
+        } elsif (($numPrinted - 1) % 15 == 0) {
+            print ",\n# $atom";
+        } else {
+            print ", $atom";
+        }
+    }
+    print "\n";
+}
+
+print "#\n#################################################\n\n";
+
+#################################################
+# WRITE THE LIST MOLECULES BY ATOM
+#################################################
+
+print "#################################################\n";
+print "# MOLECULES BY ATOM #############################\n";
+print "#################################################\n#\n";
+print "# ATOM / BEG_MOLECULE / END_MOLECULE\n#\n";
+
+foreach my $atom (1..$totAtoms) {
+    print "# $atom  /  $moleculeID[$atom]  /  $endMoleculeID[$atom]\n";
+}
+
+print "#\n";
+print "#################################################\n";
+
+#################################################
+# **********************************************
+#################################################
+# **********************************************
+#
+# END PROGRAM EXECUTION
+#
+# **********************************************
+#################################################
+# **********************************************
+#################################################
+
+#################################################
+# DEFINE SUBROUTINES
+#################################################
+
+# A subroutine to print help information
+sub printHelp {
+print <<ENDHELP;
+ENDHELP
+exit;
+}
+
+# A subroutine to remove duplicates from a list
+# I also added a crude sort at the end to make debugging easier. I may
+# comment it out later.
+sub removeDuplicates {
+    my %seen;
+    my @newArray;
+    my @oldArray = @_;
+    foreach my $item (@oldArray) {
+        #Add each value to an array to be returned only if it has not already
+        #been "seen"
+        unless ($seen{$item}) {
+            push(@newArray, $item);
+            $seen{$item} = 1;
+        }
+    }
+    @newArray = sort(@newArray); #An unnecessary sort
+    #Returns an array with duplicates removed
+    return @newArray;
+}
+
+# A subroutine to find the smallest value in an array
+sub minValue {
+    #Takes an array as input
+    my $min_so_far = shift(@_);
+    #Compare all the values of an array to all the other values and find
+    #the minimum value
+    foreach my $value (@_) {
+        if ($value < $min_so_far) {
+            $min_so_far = $value;
+        }
+    }
+    #Return the minimum value of the input array
+    return $min_so_far;
+}
+
+# A subroutine to find all the indices of a particular item in an array
+# This subroutine takes an array which has duplicate values at different
+# indices and finds all the indices where a particular value occurs and
+# returns them.
+sub findTheIndex {
+    #Takes the value you want to find the indices for and the array you want
+    #to search through as input
+    my($item, @array) = @_;
+    my @indices;
+    #Look at each value in the input array
+    foreach my $index (0..$#array) {
+        #Some of the values might be undefined, so this "if" just keeps "use
+        #strict" from twitting us all the time
+        if ($array[$index]) {
+            #If the value matches your input value, add its index to an array
+            #to be returned
+            if ($item eq $array[$index]) {
+                push(@indices, $index);
+            }
+        }
+    }
+    #Returns an array of the indices of the input array where the value
+    #you were looking for was found
+    return @indices;
+}

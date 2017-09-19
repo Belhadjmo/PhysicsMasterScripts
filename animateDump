@@ -1,0 +1,410 @@
+#!/usr/bin/perl
+#################################################
+# PROGRAM: animateDump
+# PURPOSE: This program takes a LAMMPS xyz coordinate dump file as input and
+#          writes a .xyz file or a string of .xyz files that can be played
+#          as an animation in Accelrys's DS ViewerPro, CrystalMaker, and
+#          other similar programs.
+# UPDATED: Jul. 31, 2012
+# USAGE: Takes the LAMMPS dump file as input (specified with the command
+#        line option -d). Writes to standard output (so use > to create
+#        your output file).
+#            Since numbers are used in LAMMPS to refer to different atom
+#        types, you need to specify which atom type numbers correspond to
+#        which elements. Search for the section titled "Atom types" and
+#        declare as many types as you need.
+#        Command line options:
+#            [-h|help] : use this to print help information
+#            -d|dump : use this to specifiy the name of your LAMMPS dump file
+#            [-n|name] : use this to give a name for your .xyz; it will be
+#                written in the comments (2nd) line of the file
+#            [-f|frame] : use this to specify one of the following three:
+#                a) A frame number (from 1 to the total number of frames).
+#                    Each frame corresponds to a timestep in your dump file.
+#                b) A negative frame number. This allows you to count
+#                    backwards from the last frame. The final frame is -1,
+#                    the second-to-last frame is -2, and so on. WARNING: if
+#                    you use this option, you need to use the following
+#                    syntax: "-f=negativeNumber" (with no spaces or quotation
+#                    marks) Otherwise, the negative number will be read as
+#                    a command line option, rather than an argument.
+#                c) A range of frames, written in the form "firstNum-lastNum".
+#            [-t|timestep] : use this to specify one of the following two:
+#                a) A timestep number (i.e. the timestep number that is
+#                    written in your LAMMPS dump file directly under "ITEM:
+#                    TIMESTEP").
+#                b) A timestep range of the form "1stTimestep-2ndTimestep".
+#            [-p|percent] : use this to specify a range of the timesteps in
+#                percentages of the total number of timesteps in the form
+#                "loPercent-hiPercent" (don't type the actual percent signs).
+#################################################
+
+#################################################
+# Use Modules
+#################################################
+use strict;
+use warnings;
+use diagnostics;
+use Getopt::Long;
+
+#################################################
+# Define global variables
+#################################################
+
+# Command line arguments
+my $help;
+my $dumpFile;
+my $name = 'name';
+my $frameSlice;
+my $timestepSlice;
+my $percentSlice;
+
+# General variables
+my $totAtoms;
+my @values;
+my $atomID;
+my $atomType;
+my @elements;
+my @atomCoords;
+
+# Frame variables
+my $totFrames = 0;
+my $numFrames = 0;
+my $frame;
+my $negFrame; #Negative frame number, i.e. count backwards from the last
+my $loFrame;
+my $hiFrame;
+my $loFrameUnrounded;
+my $hiFrameUnrounded;
+
+# Timestep variables
+my @timesteps;
+my $sawTimestep = 0;
+my $timestep;
+my $loTimestep;
+my $hiTimestep;
+
+# Percentage variables
+my $loPercent;
+my $hiPercent;
+
+#################################################
+# Define subroutines
+#################################################
+
+# A subroutine to print help information
+sub printHelp {
+print <<ENDHELP;
+#################################################
+# PROGRAM: animateDump
+# PURPOSE: This program takes a LAMMPS xyz coordinate dump file as input and
+#          writes a .xyz file or a string of .xyz files that can be played
+#          as an animation in Accelrys's DS ViewerPro, CrystalMaker, and
+#          other similar programs.
+# USAGE: Takes the LAMMPS dump file as standard input (specified with the
+#        command line option -d). Writes to standard output (so use > to
+#        create your output file).
+#            Since numbers are used in LAMMPS to refer to different atom
+#        types, you need to specify which atom type numbers correspond to
+#        which elements. Search for the section titled "Atom types" and
+#        declare as many types as you need.
+#        Command line options:
+#            [-h|help] : use this to print help information
+#            -d|dump : use this to specifiy the name of your LAMMPS dump file
+#            [-n|name] : use this to give a name for your .xyz; it will be
+#                written in the comments (2nd) line of the file
+#            [-f|frame] : use this to specify one of the following three:
+#                a) A frame number (from 1 to the total number of frames).
+#                    Each frame corresponds to a timestep in your dump file.
+#                b) A negative frame number. This allows you to count
+#                    backwards from the last frame. The final frame is -1,
+#                    the second-to-last frame is -2, and so on. WARNING: if
+#                    you use this option, you need to use the following
+#                    syntax: "-f=negativeNumber" (with no spaces or quotation
+#                    marks) Otherwise, the negative number will be read as
+#                    a command line option, rather than an argument.
+#                c) A range of frames, written in the form "firstNum-lastNum".
+#            [-t|timestep] : use this to specify one of the following two:
+#                a) A timestep number (i.e. the timestep number that is
+#                    written in your LAMMPS dump file directly under "ITEM:
+#                    TIMESTEP").
+#                b) A timestep range of the form "1stTimestep-2ndTimestep".
+#            [-p|percent] : use this to specify a range of the timesteps in
+#                percentages of the total number of timesteps in the form
+#                "loPercent-hiPercent" (don't type the actual percent signs).
+#################################################
+ENDHELP
+exit;
+}
+
+# A subroutine to write the .xyz file for one timestep, given that
+# timestep's number
+sub writeFrame {
+    ($timestep) = @_;
+
+    #Print the header information
+    print "$totAtoms\n";
+    print "$name\ttimestep $timestep\n";
+
+    #Find the correct timestep in the dump file
+    while (my $line = <DUMPFILE>) {
+        if ($line =~ /\A$timestep\Z/) { last; }
+    }
+
+    #Move the read cursor to the start of the atom coords section
+    #for that timestep
+    while (my $line = <DUMPFILE>) {
+        if ($line =~ /\AITEM: ATOMS/) { last; }
+    }
+
+    #Read to the end of the timestep
+    while (my $line = <DUMPFILE>) {
+        chomp($line);
+        if ($line =~ /TIMESTEP/) { last; } #End loop at end of frame
+
+        @values = split(/\s+/,$line);
+
+        $atomID = $values[0];
+        $atomType = $values[1];
+
+        $atomCoords[$atomID][0] = $values[2];
+        $atomCoords[$atomID][1] = $values[3];
+        $atomCoords[$atomID][2] = $values[4];
+
+        print "$elements[$atomType] $atomCoords[$atomID][0] ";
+        print "$atomCoords[$atomID][1] $atomCoords[$atomID][2] ";
+        print "#atomID $atomID\n";
+    }
+
+    exit;
+}
+
+# A subroutine to write a .xyz animation with a range of frames, given the
+# timestep numbers of the lowest and highest frames
+sub writeRange {
+    ($loTimestep, $hiTimestep) = @_;
+    #To count up consecutively from 1, rather than using $numFrames (because
+    #$numFrames will count EVERY timestep, even those not in the desired
+    #range, so if your range doesn't start with the first timestep, it will
+    #not have a frame number of 1)
+    my $frame = 0;
+
+    while (my $line = <DUMPFILE>) {
+        chomp($line);
+        @values = split(/\s+/,$line);
+
+        #Get rid of timestep info and skip other "ITEM:" lines
+        if ($values[0] eq "ITEM:") {
+            if ($values[1] eq "TIMESTEP") {
+                $numFrames++;
+                $timestep = $timesteps[$numFrames];
+                #Print the header info for each frame if in the specified
+                #range
+                if (($loTimestep <= $timestep) && ($hiTimestep >= $timestep)) {
+                    $frame++;
+                    print "$totAtoms\n";
+                    print "$name\tframe $frame/";
+                    print "timestep $timesteps[$numFrames]\n";
+                }
+            }
+
+        #Skip info associated with each "ITEM:" including box boundaries
+        } elsif (scalar(@values) < 4) {
+            #Do nothing
+
+        #Extract desired info: atom coords, etc. if in specified range
+        } else {
+            if (($loTimestep <= $timestep) && ($hiTimestep >= $timestep)) {
+                $atomID = $values[0];
+                $atomType = $values[1];
+
+                $atomCoords[$atomID][0] = $values[2];
+                $atomCoords[$atomID][1] = $values[3];
+                $atomCoords[$atomID][2] = $values[4];
+
+                print "$elements[$atomType] $atomCoords[$atomID][0] ";
+                print "$atomCoords[$atomID][1] $atomCoords[$atomID][2] ";
+                print "#atomID $atomID\n";
+            }
+        }
+    }
+    exit;
+}
+
+#################################################
+# Atom types
+#################################################
+
+# Edit this section as needed
+# The indices correspond to LAMMPS atom type numbers
+
+$elements[1] = "B";
+$elements[2] = "B";
+$elements[3] = "H";
+$elements[4] = "H";
+$elements[5] = "H";
+$elements[6] = "H";
+$elements[7] = "H";
+$elements[8] = "C";
+$elements[9] = "C";
+$elements[10] = "C";
+$elements[11] = "C";
+
+#################################################
+# The main part of the program
+#################################################
+
+# Read command line arguments
+GetOptions ('d|dump=s' => \$dumpFile, 'n|name:s' => \$name,
+    'f|frame:s' => \$frameSlice, 't|timestep:s' => \$timestepSlice,
+    'p|percent:s' => \$percentSlice, 'h|help' => \$help);
+
+# Print help information if requested
+if ($help) { &printHelp; }
+
+# Open the dump file for reading
+if (! open DUMPFILE, '<', $dumpFile) {
+    die "Could not open dump file $dumpFile for reading.\n";
+}
+
+# Find the total number of atoms
+while (my $line = <DUMPFILE>) {
+    chomp($line);
+    if ($line =~ /NUMBER OF ATOMS/) {
+        last;
+    }
+}
+
+# The next line tells the number of atoms
+$totAtoms = <DUMPFILE>;
+chomp($totAtoms);
+
+# Go back to the beginning of the dump file
+seek(DUMPFILE,0,0);
+
+# Find the total number of frames and match them with their timestep numbers
+# in @timesteps (the frame number is the index and the timestep number is
+# the value)
+while (my $line = <DUMPFILE>) {
+    chomp($line);
+    if ($line =~ /TIMESTEP/) {
+        $totFrames++;
+        $sawTimestep = 1;
+    } elsif ($sawTimestep == 1) {
+        chomp($line);
+        $timesteps[$totFrames] = $line;
+        $sawTimestep = 0;
+    }
+}
+
+# Go back to the beginning of the dump file
+seek(DUMPFILE,0,0);
+
+# If a frameSlice command line argument is specified: could be a specific
+# frame number, a range of frames, or a negative frame number to be counted
+# backwards from the last frame (where the last frame is -1)
+if ($frameSlice) {
+    #If the argument has a negative sign/hyphen in it: could be a range of
+    #frames or a negative frame number
+    if ($frameSlice =~ /-/) {
+
+        #If a negative frame number is given
+        if ($frameSlice =~ /\A-/) {
+            $negFrame = $frameSlice;
+            $frame = $totFrames + ($negFrame + 1);
+            $timestep = $timesteps[$frame];
+
+            &writeFrame($timestep);
+
+        #If a frame range is specified
+        } else {
+            ($loFrame, $hiFrame) = split(/-/,$frameSlice);
+            $loTimestep = $timesteps[$loFrame];
+            $hiTimestep = $timesteps[$hiFrame];
+
+            &writeRange($loTimestep, $hiTimestep);
+        }
+
+    #If a positive frame number is given
+    } else {
+        $frame = $frameSlice;
+        $timestep = $timesteps[$frame];
+
+        &writeFrame($timestep);
+    }
+
+# If a timestepSlice command line argument is specified: could be a specific
+# timestep or a range of timesteps
+} elsif ($timestepSlice) {
+
+    #If a timestep range is specified
+    if ($timestepSlice =~ /-/) {
+        ($loTimestep, $hiTimestep) = split(/-/,$timestepSlice);
+
+        &writeRange($loTimestep, $hiTimestep);
+
+    #If a timestep number is given
+    } else {
+        $timestep = $timestepSlice;
+
+        &writeFrame($timestep);
+    }
+
+# If a percentage range is specified with a command line argument
+} elsif ($percentSlice) {
+    ($loPercent, $hiPercent) = split(/-/,$percentSlice);
+    $loFrameUnrounded = ($loPercent / 100) * $totFrames;
+    $hiFrameUnrounded = ($hiPercent / 100) * $totFrames;
+
+    $loFrame = sprintf("%.0f", $loFrameUnrounded);
+    $hiFrame = sprintf("%.0f", $hiFrameUnrounded);
+
+    if ($loFrame == 0) { $loFrame = 1; }
+
+    $loTimestep = $timesteps[$loFrame];
+    $hiTimestep = $timesteps[$hiFrame];
+
+    &writeRange($loTimestep, $hiTimestep);
+
+# If no frame, timestep, or range is specified: read the whole thing
+} else {
+    while (my $line = <DUMPFILE>) {
+        chomp($line);
+        @values = split(/\s+/,$line);
+
+        #Get rid of timestep info and skip other "ITEM:" lines
+        if ($values[0] eq "ITEM:") {
+            if ($values[1] eq "TIMESTEP") {
+                $numFrames++;
+                #Print the header info for each frame
+                print "$totAtoms\n";
+                print "$name\tframe $numFrames/";
+                print "timestep $timesteps[$numFrames]\n";
+            }
+
+        #Skip info associated with each "ITEM:" including box boundaries
+        } elsif (scalar(@values) < 4) {
+            #Do nothing
+
+        #Extract desired info: atom coords, etc.
+        } else {
+            $atomID = $values[0];
+            $atomType = $values[1];
+
+            $atomCoords[$atomID][0] = $values[2];
+            $atomCoords[$atomID][1] = $values[3];
+            $atomCoords[$atomID][2] = $values[4];
+
+            print "$elements[$atomType] $atomCoords[$atomID][0] ";
+            print "$atomCoords[$atomID][1] $atomCoords[$atomID][2] ";
+            print "#atomID $atomID\n";
+        }
+    }
+}
+
+
+
+
+
+
+
